@@ -39,6 +39,36 @@
     opacity: .92;
     letter-spacing: .1em;
   }
+
+  #music {
+    position: absolute;
+    right: 16px;
+    top: 16px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 14px;
+    border-radius: 999px;
+    border: 1px solid rgba(150, 190, 255, .28);
+    background: rgba(12, 20, 38, .55);
+    color: rgba(225, 235, 255, .85);
+    font-family: "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+    font-size: 12px;
+    letter-spacing: .08em;
+    cursor: pointer;
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    transition: border-color .25s, color .25s, background .25s;
+  }
+  #music:hover { border-color: rgba(170, 210, 255, .55); }
+  #music.on { color: #fff; border-color: rgba(170, 215, 255, .7); background: rgba(24, 40, 72, .6); }
+  #music .dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: rgba(140, 170, 210, .5);
+    transition: background .25s, box-shadow .25s;
+  }
+  #music.on .dot { background: #9fd0ff; box-shadow: 0 0 8px #9fd0ff; }
+
   .hint {
     position: absolute;
     left: 50%;
@@ -50,7 +80,7 @@
     color: rgba(200, 220, 255, .45);
     white-space: nowrap;
     pointer-events: none;
-    animation: fade 6s ease-in-out 4s forwards;
+    animation: fade 8s ease-in-out 5s forwards;
   }
   @keyframes fade { to { opacity: 0; } }
   .fallback {
@@ -67,15 +97,35 @@
 
   <div class="caption">
     <span class="t1">Merry Christmas</span>
-    <span class="t2">lyt</span>
+    <span class="t2" id="nameText">baby</span>
   </div>
-  <div class="hint">拖动屏幕可以手动转动圣诞树</div>
+
+  <button id="music" type="button" aria-label="切换音乐">
+    <span class="dot"></span><span class="label">音乐</span>
+  </button>
+
+  <div class="hint">拖动屏幕转动圣诞树 · 点击右上角可开关音乐</div>
   <div class="fallback" id="fallback">当前浏览器不支持 WebGL，无法渲染这棵 3D 圣诞树。</div>
 </div>
 
 <script>
 (function () {
   'use strict';
+
+  /* ===================== 名字：先读链接里的 ?name=，再读本机缓存 ===================== */
+  (function () {
+    var el = document.getElementById('nameText');
+    if (!el) return;
+    var n = '';
+    try {
+      n = (new URLSearchParams(location.search).get('name') || '').trim();
+      if (!n) {
+        n = (new URLSearchParams(location.hash.replace(/^#/, '')).get('name') || '').trim();
+      }
+    } catch (e) {}
+    if (!n) n = localStorage.getItem('xmasName') || '';
+    if (n) el.textContent = n.slice(0, 12);
+  })();
 
   /* ===================== 全局参数（与 tree.py 保持一致） ===================== */
   var TAU = Math.PI * 2;
@@ -460,6 +510,266 @@
     }
   }
 
+  /* ===================== 音乐：Last Christmas（程序合成版） ===================== */
+  // 先把整段旋律离线合成成 WAV，再用 <audio> 循环播放。
+  // 这样做不依赖外链音频，也不受「iPhone 静音键」影响（Web Audio 会被静音键掐掉，媒体播放不会）。
+  var Music = (function () {
+    var BEAT = 60 / 108;              // 原曲约 108 BPM
+
+    // 音高：A3=57 B3=59 C4=60 D4=62 E4=64 F4=65 G3=55 G4=67
+    function freq(midi) { return 440 * Math.pow(2, (midi - 69) / 12); }
+
+    // 副歌旋律（按简谱逐句还原，单位：拍）
+    var LINE1 = [[62,.5],[62,.5],[60,.5],[55,1],[62,.5],[62,.5],[64,.5],[60,.5],[57,.5],[57,1]];   // Last Christmas I gave you my heart
+    var LINE2 = [[62,.5],[62,.5],[64,.5],[60,.5],[57,1],[59,.5],[60,.5],[59,.5],[57,1.5]];         // But the very next day you gave it away
+    var LINE3 = [[64,.5],[62,.5],[57,1],[64,.5],[65,.5],[64,.5],[62,.5],[60,1]];                   // This year to save me from tears
+    var LINE4 = [[59,.5],[60,.5],[59,.5],[59,.5],[60,.5],[59,.5],[55,1]];                           // I'll give it to someone special
+
+    // 和弦：I–vi–ii–V（C–Am–Dm–G），与旋律分行对齐
+    var CHORDS = [
+      { bass: 48, voicing: [60, 64, 67] },   // C
+      { bass: 45, voicing: [57, 60, 64] },   // Am
+      { bass: 50, voicing: [57, 62, 65] },   // Dm
+      { bass: 43, voicing: [55, 59, 62] }    // G
+    ];
+
+    var events = [];
+    var loopLen = 0;
+
+    var player = null;
+    var want = false;          // 用户是否希望播放
+    var pending = false;       // 等待下一次手势才能出声
+    var loading = false;
+
+    function build() {
+      events = [];
+      var t = 0;
+      var lines = [LINE1, LINE2, LINE3, LINE4];
+
+      for (var li = 0; li < lines.length; li++) {
+        var lineStart = t;
+        var seq = lines[li];
+        for (var i = 0; i < seq.length; i++) {
+          var d = seq[i][1] * BEAT;
+          events.push({ t: t, type: 'note', midi: seq[i][0], dur: d });
+          t += d;
+        }
+        // 和弦 & 低音：每个乐句一个和弦，铺满整句
+        events.push({ t: lineStart, type: 'chord', idx: li, dur: (t - lineStart) + BEAT * 0.5 });
+        events.push({ t: lineStart, type: 'bass', idx: li, dur: (t - lineStart) + BEAT * 0.5 });
+        t += BEAT * 0.5;  // 句间留白
+      }
+
+      loopLen = t;
+      events.sort(function (a, b) { return a.t - b.t; });
+    }
+
+    build();
+
+    function env(g, t0, peak, attack, hold, release) {
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(peak, t0 + attack);
+      g.gain.exponentialRampToValueAtTime(peak * 0.6, t0 + attack + hold);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + attack + hold + release);
+    }
+
+    function note(ctx, dest, t, midi, dur) {
+      var f = freq(midi);
+      var g = ctx.createGain();
+      var o1 = ctx.createOscillator();
+      var o2 = ctx.createOscillator();
+      var g2 = ctx.createGain();
+
+      o1.type = 'triangle';
+      o1.frequency.value = f;
+      o2.type = 'sine';
+      o2.frequency.value = f * 2;
+      g2.gain.value = 0.28;
+
+      o1.connect(g);
+      o2.connect(g2);
+      g2.connect(g);
+      g.connect(dest);
+
+      env(g, t, 0.55, 0.015, Math.min(0.18, dur), 0.35);
+      o1.start(t);
+      o2.start(t);
+      o1.stop(t + dur + 0.45);
+      o2.stop(t + dur + 0.45);
+    }
+
+    function chord(ctx, dest, t, idx, dur) {
+      var ch = CHORDS[idx % CHORDS.length];
+      var g = ctx.createGain();
+      var filter = ctx.createBiquadFilter();
+      filter.type = 'lowpass';
+      filter.frequency.value = 1200;
+
+      g.connect(filter);
+      filter.connect(dest);
+
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(0.085, t + 0.12);
+      g.gain.setValueAtTime(0.085, t + dur - 0.25);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+
+      for (var i = 0; i < ch.voicing.length; i++) {
+        var o = ctx.createOscillator();
+        o.type = 'triangle';
+        o.frequency.value = freq(ch.voicing[i]);
+        o.connect(g);
+        o.start(t);
+        o.stop(t + dur + 0.05);
+      }
+    }
+
+    function bass(ctx, dest, t, idx, dur) {
+      var ch = CHORDS[idx % CHORDS.length];
+      var o = ctx.createOscillator();
+      var g = ctx.createGain();
+      o.type = 'sine';
+      o.frequency.value = freq(ch.bass);
+      o.connect(g);
+      g.connect(dest);
+      env(g, t, 0.11, 0.02, dur * 0.4, dur * 0.5);
+      o.start(t);
+      o.stop(t + dur + 0.3);
+    }
+
+    function scheduleInto(ctx, dest, offset) {
+      for (var i = 0; i < events.length; i++) {
+        var ev = events[i];
+        var at = offset + ev.t;
+        if (ev.type === 'note') note(ctx, dest, at, ev.midi, ev.dur);
+        else if (ev.type === 'chord') chord(ctx, dest, at, ev.idx, ev.dur);
+        else bass(ctx, dest, at, ev.idx, ev.dur);
+      }
+    }
+
+    // AudioBuffer -> 16bit WAV
+    function encodeWav(buffer) {
+      var ch = buffer.numberOfChannels;
+      var sr = buffer.sampleRate;
+      var len = buffer.length;
+      var chans = [];
+      for (var c = 0; c < ch; c++) chans.push(buffer.getChannelData(c));
+
+      var blockAlign = ch * 2;
+      var buf = new ArrayBuffer(44 + len * blockAlign);
+      var view = new DataView(buf);
+
+      function ascii(off, s) {
+        for (var i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i));
+      }
+
+      ascii(0, 'RIFF');
+      view.setUint32(4, 36 + len * blockAlign, true);
+      ascii(8, 'WAVE');
+      ascii(12, 'fmt ');
+      view.setUint32(16, 16, true);
+      view.setUint16(20, 1, true);
+      view.setUint16(22, ch, true);
+      view.setUint32(24, sr, true);
+      view.setUint32(28, sr * blockAlign, true);
+      view.setUint16(32, blockAlign, true);
+      view.setUint16(34, 16, true);
+      ascii(36, 'data');
+      view.setUint32(40, len * blockAlign, true);
+
+      var off = 44;
+      for (var i = 0; i < len; i++) {
+        for (var k = 0; k < ch; k++) {
+          var s = chans[k][i];
+          s = s < -1 ? -1 : (s > 1 ? 1 : s);
+          view.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+          off += 2;
+        }
+      }
+      return buf;
+    }
+
+    function prepare() {
+      if (player || loading) return;
+      var OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+      if (!OAC) return;
+
+      loading = true;
+      try {
+        var sr = 44100;
+        var octx = new OAC(2, Math.ceil(loopLen * sr), sr);
+        var dest = octx.createGain();
+        dest.gain.value = 1.0;
+        dest.connect(octx.destination);
+        scheduleInto(octx, dest, 0.02);
+
+        octx.startRendering().then(function (rendered) {
+          var wav = encodeWav(rendered);
+          var url = URL.createObjectURL(new Blob([wav], { type: 'audio/wav' }));
+
+          player = new Audio();
+          player.src = url;
+          player.loop = true;
+          player.preload = 'auto';
+          player.volume = 0.95;
+          loading = false;
+          if (want) tryPlay();
+        }).catch(function () { loading = false; });
+      } catch (err) {
+        loading = false;
+      }
+    }
+
+    function tryPlay() {
+      if (!player) { pending = true; prepare(); return; }
+      var p = player.play();
+      if (p && p.then) {
+        p.then(function () { pending = false; })
+         .catch(function () { pending = true; });
+      }
+    }
+
+    return {
+      start: function () { want = true; tryPlay(); return true; },
+      stop: function () { want = false; pending = false; if (player) player.pause(); },
+      isOn: function () { return want; },
+      retry: function () { if (want) tryPlay(); },
+      prefetch: prepare,
+      isPending: function () { return pending; }
+    };
+  })();
+
+  var musicBtn = document.getElementById('music');
+  var hintEl = document.querySelector('.hint');
+
+  function setMusicUI(on) {
+    musicBtn.classList.toggle('on', on);
+    musicBtn.querySelector('.label').textContent = on ? '音乐 开' : '音乐';
+  }
+
+  function showTip(text) {
+    hintEl.textContent = text;
+    hintEl.style.animation = 'none';
+    hintEl.style.opacity = '1';
+  }
+
+  musicBtn.addEventListener('click', function (e) {
+    e.stopPropagation();
+    if (Music.isOn()) {
+      Music.stop();
+      setMusicUI(false);
+    } else {
+      Music.start();
+      setMusicUI(true);
+      // 被浏览器策略挡住时提示用户再点一下
+      setTimeout(function () {
+        if (Music.isPending()) showTip('点一下屏幕任意位置，音乐才会响起');
+      }, 1000);
+    }
+  });
+
+  // 页面打开后先偷偷把整段音频渲染好，这样第一次点击就能立刻出声
+  setTimeout(function () { Music.prefetch(); }, 600);
+
   /* ===================== 交互：拖动旋转 ===================== */
   var angle = 0.0;
   var baseSpeed = 0.0045;     // 每 1/60 秒
@@ -485,6 +795,22 @@
   window.addEventListener('pointermove', pointerMove, { passive: true });
   window.addEventListener('pointerup', pointerUp);
   window.addEventListener('pointercancel', pointerUp);
+
+  // 浏览器要求必须先有用户手势才能出声：首次点击/触摸自动开始播放
+  var firstGesture = false;
+  function onFirstGesture(e) {
+    if (e.target && e.target.closest && e.target.closest('#music')) return;
+    if (!firstGesture) {
+      firstGesture = true;
+      Music.start();
+      setMusicUI(true);
+    } else {
+      // 之前被浏览器策略挡住过，这次手势再补一次播放
+      Music.retry();
+    }
+  }
+  window.addEventListener('pointerdown', onFirstGesture);
+  window.addEventListener('keydown', onFirstGesture);
 
   /* ===================== 主循环 ===================== */
   var lastT = performance.now();
